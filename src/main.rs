@@ -70,14 +70,14 @@ fn server(messages: Receiver<Message>) {
             Message::ClientDisconnected { author: stream } => {
                 if let Ok(addr) = stream.peer_addr() { //Same here too
                     clients.remove(&addr);
-                    printn!("INFO: Client disconnected from {}", addr);
+                    println!("INFO: Client disconnected from {}", addr);
                 }  
             }
             Message::NewMessage { author: stream, buffer: byte } => {
                 if let Ok(author_addr) = stream.peer_addr() {
-                    let text = String::from_ytf8_lossy(&byte); //Sanitization to check if bytes are valid UTF-8
+                    let text = String::from_utf8_lossy(&byte); //Sanitization to check if bytes are valid UTF-8
                     let mut msg = format!("{}> ", author_addr).into_bytes(); //To avoid terminal injection
-                    msg.extend(&byte);
+                    msg.extend(text.as_bytes());
 
                     for (addr, client) in clients.iter() {
                         if *addr != author_addr {
