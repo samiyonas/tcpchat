@@ -37,17 +37,23 @@ fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
     messages.send(Message::ClientConnected{author: stream.clone()}).map_err(|e| {
         eprintln!("ERROR: couldn't write to a stream: {e}");
     })?;
-    let mut buffer = Vec::new();
-    buffer.resize(64, 0);
+    let mut buffer = [0u8; 1024]; //fixed-size buffer to prevent memory exhaustion
     loop {
        let n = stream.as_ref().read(&mut buffer).map_err(|e| {
            eprintln!("ERROR: couldn't read from stream: {e}");
            let _ = messages.send(Message::ClientDisconnected{author: stream.clone()});
        })?;
+
+       if n == 0 { // Clean disconnect
+        let _ = messages.send(Message::ClientDisconnected{author: stream.clone()});
+        break;
+       }
+
         messages.send(Message::NewMessage{author: stream.clone(), buffer: buffer[0..n].to_vec()}).map_err(|e| {
             eprintln!("ERROR: couldn't send to server: {e}");
         })?;
     }
+    Ok(())
 }
 
 fn server(messages: Receiver<Message>) {
@@ -56,21 +62,27 @@ fn server(messages: Receiver<Message>) {
         let msg = messages.recv().expect("server couldn't receive");
         match msg {
             Message::ClientConnected { author: stream } => {
-                let addr = stream.peer_addr().unwrap();
-                clients.insert(addr, Client { conn: stream });
+                if let Ok(addr) = stream.peer_addr() { //Use "if let" instead of unwrap to hable errors
+                    clients.insert(addr, Client { conn: stream });
+                    println!("INFO: Client connected from {}", addr); 
+                }
             }
             Message::ClientDisconnected { author: stream } => {
-                let addr = stream.peer_addr().unwrap();
-                clients.remove(&addr);
+                if let Ok(addr) = stream.peer_addr() { //Same here too
+                    clients.remove(&addr);
+                    printn!("INFO: Client disconnected from {}", addr);
+                }  
             }
             Message::NewMessage { author: stream, buffer: byte } => {
-                let author_addr = stream.peer_addr().unwrap();
-                let mut msg = format!("{}> ", author_addr).into_bytes();
-                msg.extend(&byte);
+                if let Ok(author_addr) = stream.peer_addr() {
+                    let text = String::from_ytf8_lossy(&byte); //Sanitization to check if bytes are valid UTF-8
+                    let mut msg = format!("{}> ", author_addr).into_bytes(); //To avoid terminal injection
+                    msg.extend(&byte);
 
-                for (addr, client) in clients.iter() {
-                    if *addr != author_addr {
-                        let _ = client.conn.as_ref().write(&msg);
+                    for (addr, client) in clients.iter() {
+                        if *addr != author_addr {
+                            let _ = client.conn.as_ref().write_all(&msg); //Ignore errors on write when a client dies and doesn't stop the loop
+                        }
                     }
                 }
             }
@@ -79,7 +91,7 @@ fn server(messages: Receiver<Message>) {
 }
 
 fn main() -> Result<()> {
-    let address = "127.0.0.1:6969";
+    let address = "0.0.0.0:6969"; // To alllow connection from outside your own machine
     println!("Listening for requests at http://{}", Sensitive{inner: address});
     let listener = TcpListener::bind(address).map_err(|e| {
         eprintln!("ERROR: could not bind {address}:{e}", e = Sensitive{inner: e})
