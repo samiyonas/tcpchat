@@ -1,11 +1,15 @@
-use std::net::{TcpListener, TcpStream};
-use std::result;
+use std::net::{SocketAddr, TcpListener, TcpStream}; use std::result;
 use std::io::{ Write, Read };
-use std::fmt::{Display, Formatter};
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::fmt::{ Display, Formatter };
+use std::sync::mpsc::{ channel, Sender, Receiver };
 use std::thread;
-use std::sync::Arc;
+use std::sync::{ Arc, Mutex };
 use std::collections::HashMap;
+use rustls::{ StreamOwned, ServerConfig, ServerConnection };
+use rustls_pemfile;
+use std::fs::File;
+use std::io::BufReader;
+
 type Result<T> = result::Result<T, ()>;
 const SAFE_MODE: bool = true;
 
@@ -24,27 +28,29 @@ impl<T: Display> Display for Sensitive<T> {
 }
 
 enum Message {
-    ClientConnected{author: Arc<TcpStream>},
-    ClientDisconnected{author: Arc<TcpStream>},
-    NewMessage{author: Arc<TcpStream>, buffer: Vec<u8>},
+    ClientConnected{author: SocketAddr, stream: Arc<Mutex<StreamOwned<ServerConnection, TcpStream>>>},
+    ClientDisconnected{author: SocketAddr},
+    NewMessage{author: SocketAddr, buffer: Vec<u8>},
 }
 
 struct Client {
-    conn: Arc<TcpStream>,
+    conn: Arc<Mutex<StreamOwned<ServerConnection, TcpStream>>>,
 }
 
-fn client(stream: Arc<TcpStream>, messages: Sender<Message>) -> Result<()> {
-    messages.send(Message::ClientConnected{author: stream.clone()}).map_err(|e| {
+fn client(stream: StreamOwned<ServerConnection, TcpStream>, messages: Sender<Message>, addr: SocketAddr) -> Result<()> {
+    let shared_stream = Arc::new(Mutex::new(stream));
+    messages.send(Message::ClientConnected{author: addr, stream: shared_stream.clone()}).map_err(|e| {
         eprintln!("ERROR: couldn't write to a stream: {e}");
     })?;
     let mut buffer = Vec::new();
     buffer.resize(64, 0);
     loop {
-       let n = stream.as_ref().read(&mut buffer).map_err(|e| {
+        let mut conn = shared_stream.lock().unwrap();
+       let n = conn.read(&mut buffer).map_err(|e| {
            eprintln!("ERROR: couldn't read from stream: {e}");
-           let _ = messages.send(Message::ClientDisconnected{author: stream.clone()});
+           let _ = messages.send(Message::ClientDisconnected{author: addr});
        })?;
-        messages.send(Message::NewMessage{author: stream.clone(), buffer: buffer[0..n].to_vec()}).map_err(|e| {
+        messages.send(Message::NewMessage{author: addr, buffer: buffer[0..n].to_vec()}).map_err(|e| {
             eprintln!("ERROR: couldn't send to server: {e}");
         })?;
     }
@@ -55,22 +61,20 @@ fn server(messages: Receiver<Message>) {
     loop {
         let msg = messages.recv().expect("server couldn't receive");
         match msg {
-            Message::ClientConnected { author: stream } => {
-                let addr = stream.peer_addr().unwrap();
-                clients.insert(addr, Client { conn: stream });
+            Message::ClientConnected { author: addr, stream} => {
+                clients.insert(addr, Client { conn: stream.clone() });
             }
-            Message::ClientDisconnected { author: stream } => {
-                let addr = stream.peer_addr().unwrap();
+            Message::ClientDisconnected { author: addr } => {
                 clients.remove(&addr);
             }
-            Message::NewMessage { author: stream, buffer: byte } => {
-                let author_addr = stream.peer_addr().unwrap();
-                let mut msg = format!("{}> ", author_addr).into_bytes();
+            Message::NewMessage { author: addr, buffer: byte } => {
+                let mut msg = format!("{}> ", addr).into_bytes();
                 msg.extend(&byte);
 
-                for (addr, client) in clients.iter() {
-                    if *addr != author_addr {
-                        let _ = client.conn.as_ref().write(&msg);
+                for (address, client) in clients.iter() {
+                    if *address != addr {
+                        let mut cli_conn = client.conn.lock().unwrap();
+                        let _ = cli_conn.write(&msg);
                     }
                 }
             }
@@ -79,7 +83,32 @@ fn server(messages: Receiver<Message>) {
 }
 
 fn main() -> Result<()> {
-    let address = "127.0.0.1:6969";
+    let cert_file = File::open("cert.pem").unwrap();
+    let mut reader = BufReader::new(cert_file);
+    let certs = rustls_pemfile::certs(&mut reader);
+    let mut certificate = Vec::new();
+    for cert in certs {
+        match cert {
+            Ok(cert) => {certificate.push(cert);},
+            Err(_) => {return Err(());}
+        }
+    }
+
+    let key_file = File::open("key.pem").unwrap();
+    let mut reader = BufReader::new(key_file);
+    let secret_key;
+    match rustls_pemfile::private_key(&mut reader) {
+        Ok(Some(key)) => { secret_key = key; },
+        Ok(None) => { return Err(()); },
+        Err(_) => { return Err(()); }
+    }
+
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificate, secret_key)
+        .expect("could not build server config");
+
+    let address = "0.0.0.0:6969";
     println!("Listening for requests at http://{}", Sensitive{inner: address});
     let listener = TcpListener::bind(address).map_err(|e| {
         eprintln!("ERROR: could not bind {address}:{e}", e = Sensitive{inner: e})
@@ -91,9 +120,11 @@ fn main() -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let addr = stream.peer_addr().unwrap();
                 let message_sender = message_sender.clone();
-                let stream = Arc::new(stream);
-                thread::spawn(|| client(stream, message_sender));
+                let server_connection = ServerConnection::new(Arc::new(server_config.clone())).unwrap();
+                let tls_stream = StreamOwned::new(server_connection, stream);
+                thread::spawn(move || client(tls_stream, message_sender, addr));
             }
             Err(e) => {
                 eprintln!("ERROR: could not accept connection {address}:{e}");
