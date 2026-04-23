@@ -22,11 +22,11 @@ rustc src/main.rs
 ```
 #### terminal 2
 ```angular2html
-telnet 127.0.0.1 6969
+openssl s_client -connect 127.0.0.1:6969 -quiet
 ```
 #### terminal 3
 ```angular2html
-telnet 127.0.0.1 6969
+openssl s_client -connect 127.0.0.1:6969 -quiet
 ```
 
 you can now chat between terminal 2 and terminal 3
