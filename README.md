@@ -18,7 +18,7 @@ rustc src/main.rs
 ### run
 #### terminal 1
 ```angular2html
-./main
+./target/release/main
 ```
 #### terminal 2
 ```angular2html
