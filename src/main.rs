@@ -1,14 +1,16 @@
-use std::net::{SocketAddr, TcpListener, TcpStream}; use std::result;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::result;
 use std::io::{ Write, Read };
 use std::fmt::{ Display, Formatter };
 use std::sync::mpsc::{ channel, Sender, Receiver };
 use std::thread;
-use std::sync::{ Arc, Mutex };
+use std::sync::{ Arc };
 use std::collections::HashMap;
-use rustls::{ StreamOwned, ServerConfig, ServerConnection };
+use rustls::{StreamOwned, ServerConfig, ServerConnection};
 use rustls_pemfile;
 use std::fs::File;
 use std::io::BufReader;
+use env_logger;
 
 type Result<T> = result::Result<T, ()>;
 const SAFE_MODE: bool = true;
@@ -26,63 +28,83 @@ impl<T: Display> Display for Sensitive<T> {
         }
     }
 }
-
-enum Message {
-    ClientConnected{author: SocketAddr, stream: Arc<Mutex<StreamOwned<ServerConnection, TcpStream>>>},
-    ClientDisconnected{author: SocketAddr},
+ enum Message {
+     ClientConnected{author: SocketAddr, sender: Sender<Message>},
+     ClientDisconnected{author: SocketAddr},
     NewMessage{author: SocketAddr, buffer: Vec<u8>},
 }
 
 struct Client {
-    conn: Arc<Mutex<StreamOwned<ServerConnection, TcpStream>>>,
+    conn: Sender<Message>,
 }
 
-fn client(stream: StreamOwned<ServerConnection, TcpStream>, messages: Sender<Message>, addr: SocketAddr) -> Result<()> {
-    let shared_stream = Arc::new(Mutex::new(stream));
-    messages.send(Message::ClientConnected{author: addr, stream: shared_stream.clone()}).map_err(|e| {
+fn client(mut stream: StreamOwned<ServerConnection, TcpStream>, messages: Sender<Message>, addr: SocketAddr)  {
+    let (cs, cr) = channel();
+    let _ = messages.send(Message::ClientConnected{author: addr, sender: cs}).map_err(|e| {
         eprintln!("ERROR: couldn't write to a stream: {e}");
-    })?;
+    });
     let mut buffer = Vec::new();
-    buffer.resize(64, 0);
+    buffer.resize(1024, 0);
     loop {
-        let mut conn = shared_stream.lock().unwrap();
-       let n = conn.read(&mut buffer).map_err(|e| {
-           eprintln!("ERROR: couldn't read from stream: {e}");
-           let _ = messages.send(Message::ClientDisconnected{author: addr});
-       })?;
-        messages.send(Message::NewMessage{author: addr, buffer: buffer[0..n].to_vec()}).map_err(|e| {
-            eprintln!("ERROR: couldn't send to server: {e}");
-        })?;
-    }
-}
-
-fn server(messages: Receiver<Message>) {
-   let mut clients = HashMap::new();
-    loop {
-        let msg = messages.recv().expect("server couldn't receive");
-        match msg {
-            Message::ClientConnected { author: addr, stream} => {
-                clients.insert(addr, Client { conn: stream.clone() });
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                let _ = messages.send(Message::ClientDisconnected{author: addr});
+                break
             }
-            Message::ClientDisconnected { author: addr } => {
-                clients.remove(&addr);
+            Ok(n) => {
+                let _ = messages.send(Message::NewMessage{author: addr, buffer: buffer[0..n].to_vec()});
             }
-            Message::NewMessage { author: addr, buffer: byte } => {
-                let mut msg = format!("{}> ", addr).into_bytes();
-                msg.extend(&byte);
-
-                for (address, client) in clients.iter() {
-                    if *address != addr {
-                        let mut cli_conn = client.conn.lock().unwrap();
-                        let _ = cli_conn.write(&msg);
-                    }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_e) => {
+                let _ = messages.send(Message::ClientDisconnected{author: addr});
+            },
+        }
+        while let Ok(msg) = cr.try_recv() {
+            match msg {
+                Message::NewMessage{author: _author,  buffer} => {
+                    let _ = stream.write_all(&buffer);
+                    let _ = stream.flush();
                 }
+                _ => {}
             }
         }
     }
 }
 
+fn server(messages: Receiver<Message>) {
+    let mut clients = HashMap::new();
+    loop {
+        let msg = messages.recv().expect("server couldn't receive");
+        match msg {
+            Message::ClientConnected{author, sender} => {
+                clients.insert(author, Client {conn: sender});
+            }
+            Message::ClientDisconnected{author} => {
+                clients.remove(&author);
+            }
+            Message::NewMessage{author, buffer} => {
+                let mut dead_clients = Vec::new();
+                let mut text = format!("{}> ", author).into_bytes();
+                text.extend(buffer);
+                for (addr, client) in clients.iter() {
+                    if *addr != author {
+                        if  client.conn.send(Message::NewMessage{author, buffer: text.clone()}).is_err() {
+                            dead_clients.push(addr.clone());
+                        }
+                    }
+                }
+
+                for dead in dead_clients {
+                    clients.remove(&dead);
+                }
+            }
+        }
+
+    }
+}
+
 fn main() -> Result<()> {
+    env_logger::init();
     let cert_file = File::open("cert.pem").unwrap();
     let mut reader = BufReader::new(cert_file);
     let certs = rustls_pemfile::certs(&mut reader);
@@ -120,6 +142,9 @@ fn main() -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                stream.set_nonblocking(true).map_err(|err| {
+                    eprintln!("ERROR: could not set nonblocking on {address}:{err}");
+                })?;
                 let addr = stream.peer_addr().unwrap();
                 let message_sender = message_sender.clone();
                 let server_connection = ServerConnection::new(Arc::new(server_config.clone())).unwrap();
