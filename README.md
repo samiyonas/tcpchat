@@ -12,13 +12,13 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -sha256 -days 3
 
 ### compile
 ```angular2html
-rustc src/main.rs
+cargo build --release
 ```
 
 ### run
 #### terminal 1
 ```angular2html
-./target/release/main
+./target/release/chat
 ```
 #### terminal 2
 ```angular2html
